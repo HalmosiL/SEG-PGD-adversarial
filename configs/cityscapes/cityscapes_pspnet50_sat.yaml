@@ -1,5 +1,5 @@
 DATA:
-  data_root: ../images/
+  data_root: ../../images/
   train_list: ../dataset/cityscapes/list/fine_train.txt
   val_list: ../dataset/cityscapes/list/fine_val.txt
   classes: 19
