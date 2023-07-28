@@ -3,34 +3,62 @@ import torch.nn as nn
 import argparse
 import json
 import sys
+import cv2
 
 sys.path.insert(0, "../")
 
-from utils.model import get_model_dummy, get_model
+from utils import transform
+from utils import dataset
+from utils import config
+from model.pspnet import PSPNet
 
-# Parse the command line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--config", help="Path to the config file")
-args = parser.parse_args()
+cv2.ocl.setUseOpenCL(False)
+cv2.setNumThreads(0)
 
-# Load the config file
-config_path = args.config
-with open(config_path) as config_file:
-    config = json.load(config_file)
+def get_parser():
+    parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
+    parser.add_argument('--config', type=str, default='../configs/cityscapes/cityscapes_pspnet50_sat.yaml', help='config file')
+    parser.add_argument('--attack_iters', default=7, type=int)
+    parser.add_argument('--eps', default=0.03, type=float)
+    parser.add_argument('--alpha', default=0.01, type=float)
+    parser.add_argument('--rand_init', default=None, type=str, help='norm, uniform')
+
+    parser.add_argument('--data_adv', default='mixed', type=str, help='mixed, adv_only, clean_only')
+    parser.add_argument('--method_name', default='', type=str)
+    parser.add_argument('--num_batch', default=0, type=int)
+    parser.add_argument('--manual_seed', default=1, type=int)
+
+    # Setting for Attack method
+    parser.add_argument('--loss', default='ce', type=str)
+    parser.add_argument('--miscls_loss_lamb', default=0.5, type=float)
+    parser.add_argument('opts', help='see configs/cityscapes/cityscapes_pspnet50_sat.yamll for all options', default=None, nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    assert args.config is not None
+    cfg = config.load_cfg_from_cfg_file(args.config)
+    cfg = config.merge_cfg_from_args(cfg, args)
+    if args.opts is not None:
+        cfg = config.merge_cfg_from_list(cfg, args.opts)
+    return cfg
+
+
+def get_logger():
+    logger_name = "main-logger"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    fmt = "[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"
+    handler.setFormatter(logging.Formatter(fmt))
+    logger.addHandler(handler)
+    return logger
 
 # Extract the hyperparameters and device configuration
-hyperparameters = config['hyperparameters']
-device = config['device']
-mode = config['mode']
+args = get_parser()
+args.save_path = args.save_path + '_' + args.method_name
 
 # Define your loss function
 loss_fn = nn.CrossEntropyLoss()
 
 def train(model, dataloader, optimizer):
-    model.train()
-    total_loss = 0.0
-    total_accuracy = 0.0
-
     for batch_idx, (data, target) in enumerate(dataloader):
         # Move the data and target tensors to the device
         data = data.to(device)
@@ -107,48 +135,66 @@ def training_loop(model, train_dataloader, val_dataloader, optimizer, num_epochs
 
     print("Training completed!")
 
-def test(model, test_dataloader):
-    model.eval()
-    total_loss = 0.0
-    total_accuracy = 0.0
+value_scale = 255
+mean = [0.485, 0.456, 0.406]
+mean = [item * value_scale for item in mean]
+std = [0.229, 0.224, 0.225]
+std = [item * value_scale for item in std]
 
-    with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(test_dataloader):
-            # Move the data and target tensors to the device
-            data = data.to(device)
-            target = target.to(device)
+criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
 
-            # Forward pass
-            output = model(data)
+model = PSPNet(
+    layers=args.layers,
+    classes=args.classes,
+    zoom_factor=args.zoom_factor,
+    criterion=criterion,
+    BatchNorm=torch.nn.BatchNorm2d,
+    pretrained=False
+)
 
-            # Calculate the loss
-            loss = loss_fn(output, target)
+optimizer = torch.optim.SGD(
+    [{'params': model.layer0.parameters()},
+        {'params': model.layer1.parameters()},
+        {'params': model.layer2.parameters()},
+        {'params': model.layer3.parameters()},
+        {'params': model.layer4.parameters()},
+        {'params': model.ppm.parameters(), 'lr': args.base_lr * 10},
+        {'params': model.cls.parameters(), 'lr': args.base_lr * 10},
+        {'params': model.aux.parameters(), 'lr': args.base_lr * 10}],
+    lr=args.base_lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-            # Update metrics
-            total_loss += loss.item()
-            _, predicted = torch.max(output.data, 1)
-            total_accuracy += (predicted == target).sum().item()
+train_transform = transform.Compose([
+    transform.RandScale([args.scale_min, args.scale_max]),
+    transform.RandRotate([args.rotate_min, args.rotate_max], padding=mean, ignore_label=args.ignore_label),
+    transform.RandomGaussianBlur(),
+    transform.RandomHorizontalFlip(),
+    transform.Crop([args.train_h, args.train_w], crop_type='rand', padding=mean, ignore_label=args.ignore_label),
+    transform.ToTensor(),
+    transform.Normalize(mean=mean, std=std)])
 
-    # Calculate average loss and accuracy
-    avg_loss = total_loss / len(test_dataloader.dataset)
-    accuracy = total_accuracy / len(test_dataloader.dataset)
+train_data = dataset.SemData(
+    split='train',
+    data_root=args.data_root,
+    data_list=args.train_list,
+    transform=train_transform
+)
 
-    return avg_loss, accuracy
+train_loader = torch.utils.data.DataLoader(
+    train_data,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=args.workers,
+    pin_memory=True,
+    drop_last=True
+)
 
-# Example usage
-if(mode == "dummy"):
-    model = get_model_dummy(device)
-else:
-    model = get_model(device)
+training_loop(
+    model,
+    train_loader,
+    optimizer,
+    criterion,
+    args.epochs
+)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=hyperparameters['learning_rate'])
-train_dataloader = get_train_dataloader(hyperparameters['batch_size'])  # Replace with your function to get the train dataloader
-val_dataloader = get_val_dataloader(hyperparameters['batch_size'])  # Replace with your function to get the validation dataloader
-test_dataloader = get_test_dataloader(hyperparameters['batch_size'])  # Replace with your function to get the test dataloader
-
-# Training loop
-training_loop(model, train_dataloader, val_dataloader, optimizer, hyperparameters['num_epochs'])
-
-# Testing
 test_loss, test_accuracy = test(model, test_dataloader)
 print(f"Test Loss: {test_loss:.4f} - Test Accuracy: {test_accuracy:.4f}")
